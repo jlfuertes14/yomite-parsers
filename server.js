@@ -51,6 +51,21 @@ function getImageUrl(item) {
   return item.enclosure?.url || item.enclosure?.link || item['media:content']?.url || item['media:thumbnail']?.url;
 }
 
+function getYoutubeEmbedUrl(value) {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    if (url.hostname === 'youtu.be') return `https://www.youtube.com/embed${url.pathname}`;
+    if (url.hostname.endsWith('youtube.com')) {
+      const videoId = url.searchParams.get('v') || url.pathname.match(/\/embed\/([^/?]+)/)?.[1];
+      return videoId ? `https://www.youtube.com/embed/${videoId}` : undefined;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
 async function fetchFeed() {
   if (feedCache.value && feedCache.expiresAt > Date.now()) return feedCache.value;
 
@@ -69,9 +84,22 @@ async function fetchFeed() {
       })).filter((item) => item.url);
 
       if (items.length > 0) {
-        feedCache.value = items;
+        const enrichedItems = await Promise.all(items.slice(0, 8).map(async (item) => {
+          try {
+            const article = await fetchArticle(item.url);
+            return {
+              ...item,
+              imageUrl: article.imageUrl || item.imageUrl,
+              trailerUrl: article.trailerUrl,
+            };
+          } catch {
+            return item;
+          }
+        }));
+        const mergedItems = [...enrichedItems, ...items.slice(8)];
+        feedCache.value = mergedItems;
         feedCache.expiresAt = Date.now() + feedTtlMs;
-        return items;
+        return mergedItems;
       }
     } catch (error) {
       lastError = error;
@@ -101,6 +129,10 @@ async function fetchArticle(url) {
 
   const html = await response.text();
   const $ = cheerio.load(html);
+  const trailerUrl = $('iframe[src*="youtube.com"], iframe[src*="youtu.be"], a[href*="youtube.com"], a[href*="youtu.be"]')
+    .map((_, element) => getYoutubeEmbedUrl($(element).attr('src') || $(element).attr('href')))
+    .get()
+    .find(Boolean);
   $('script, style, noscript, nav, aside, footer, form, iframe').remove();
 
   const articleRoot = $('article').first().length ? $('article').first() : $('main').first();
@@ -113,6 +145,7 @@ async function fetchArticle(url) {
     title: cleanText($('meta[property="og:title"]').attr('content') || $('title').text()),
     summary: cleanText($('meta[property="og:description"]').attr('content') || ''),
     imageUrl: $('meta[property="og:image"]').attr('content') || undefined,
+    trailerUrl,
     publishedAt: $('meta[property="article:published_time"]').attr('content') || undefined,
     url,
     source: 'Anime News Network',
