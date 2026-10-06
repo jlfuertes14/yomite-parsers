@@ -66,6 +66,15 @@ function getYoutubeEmbedUrl(value) {
   return undefined;
 }
 
+function toAbsoluteUrl(value, baseUrl) {
+  if (!value) return undefined;
+  try {
+    return new URL(value, baseUrl).toString();
+  } catch {
+    return undefined;
+  }
+}
+
 async function fetchFeed() {
   if (feedCache.value && feedCache.expiresAt > Date.now()) return feedCache.value;
 
@@ -90,7 +99,9 @@ async function fetchFeed() {
             return {
               ...item,
               imageUrl: article.imageUrl || item.imageUrl,
+              images: article.images,
               trailerUrl: article.trailerUrl,
+              trailerUrls: article.trailerUrls,
             };
           } catch {
             return item;
@@ -129,10 +140,25 @@ async function fetchArticle(url) {
 
   const html = await response.text();
   const $ = cheerio.load(html);
-  const trailerUrl = $('iframe[src*="youtube.com"], iframe[src*="youtu.be"], a[href*="youtube.com"], a[href*="youtu.be"]')
-    .map((_, element) => getYoutubeEmbedUrl($(element).attr('src') || $(element).attr('href')))
+  const trailerUrls = $('iframe, a')
+    .map((_, element) => getYoutubeEmbedUrl(
+      $(element).attr('src') || $(element).attr('data-src') || $(element).attr('href')
+    ))
     .get()
-    .find(Boolean);
+    .filter(Boolean)
+    .filter((url, index, values) => values.indexOf(url) === index);
+  const imageUrls = [
+    $('meta[property="og:image"]').attr('content'),
+    $('meta[name="twitter:image"]').attr('content'),
+    $('link[rel="image_src"]').attr('href'),
+    ...$('article img, main img, figure img')
+      .map((_, element) => $(element).attr('src') || $(element).attr('data-src') || $(element).attr('data-lazy-src'))
+      .get(),
+  ]
+    .map((value) => toAbsoluteUrl(value, url))
+    .filter(Boolean)
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .slice(0, 30);
   $('script, style, noscript, nav, aside, footer, form, iframe').remove();
 
   const articleRoot = $('article').first().length ? $('article').first() : $('main').first();
@@ -144,11 +170,10 @@ async function fetchArticle(url) {
   const value = {
     title: cleanText($('meta[property="og:title"]').attr('content') || $('title').text()),
     summary: cleanText($('meta[property="og:description"]').attr('content') || ''),
-    imageUrl: $('meta[property="og:image"]').attr('content')
-      || $('meta[name="twitter:image"]').attr('content')
-      || $('link[rel="image_src"]').attr('href')
-      || undefined,
-    trailerUrl,
+    imageUrl: imageUrls[0],
+    images: imageUrls,
+    trailerUrl: trailerUrls[0],
+    trailerUrls,
     publishedAt: $('meta[property="article:published_time"]').attr('content') || undefined,
     url,
     source: 'Anime News Network',
