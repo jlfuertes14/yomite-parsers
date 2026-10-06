@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: yomite-parser
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: CORS_ORIGINS
+        value: https://yomite.vercel.app
