@@ -55,15 +55,22 @@ function getYoutubeEmbedUrl(value) {
   if (!value) return undefined;
   try {
     const url = new URL(value);
-    if (url.hostname === 'youtu.be') return `https://www.youtube.com/embed${url.pathname}`;
-    if (url.hostname.endsWith('youtube.com')) {
-      const videoId = url.searchParams.get('v') || url.pathname.match(/\/embed\/([^/?]+)/)?.[1];
-      return videoId ? `https://www.youtube.com/embed/${videoId}` : undefined;
+    let videoId;
+    if (url.hostname === 'youtu.be') {
+      videoId = url.pathname.replace(/^\/+/, '').split('/')[0];
+    } else if (url.hostname === 'youtube.com' || url.hostname.endsWith('.youtube.com')) {
+      videoId = url.searchParams.get('v')
+        || url.pathname.match(/\/embed\/([^/?]+)/)?.[1]
+        || url.pathname.match(/\/shorts\/([^/?]+)/)?.[1];
     }
+    if (!videoId) return undefined;
+    const embedUrl = new URL(`https://www.youtube.com/embed/${videoId}`);
+    embedUrl.searchParams.set('origin', 'https://yomite.vercel.app');
+    embedUrl.searchParams.set('enablejsapi', '1');
+    return embedUrl.toString();
   } catch {
     return undefined;
   }
-  return undefined;
 }
 
 function toAbsoluteUrl(value, baseUrl) {
