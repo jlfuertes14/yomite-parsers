@@ -144,7 +144,10 @@ async function fetchArticle(url) {
   const value = {
     title: cleanText($('meta[property="og:title"]').attr('content') || $('title').text()),
     summary: cleanText($('meta[property="og:description"]').attr('content') || ''),
-    imageUrl: $('meta[property="og:image"]').attr('content') || undefined,
+    imageUrl: $('meta[property="og:image"]').attr('content')
+      || $('meta[name="twitter:image"]').attr('content')
+      || $('link[rel="image_src"]').attr('href')
+      || undefined,
     trailerUrl,
     publishedAt: $('meta[property="article:published_time"]').attr('content') || undefined,
     url,
