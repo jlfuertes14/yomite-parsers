@@ -57,11 +57,22 @@ function getImageUrl(item) {
 function getYoutubeEmbedUrl(value) {
   if (!value) return undefined;
   try {
-    const url = new URL(value);
+    const raw = String(value).trim();
+    // Direct YouTube video ID (11 chars)
+    if (/^[a-zA-Z0-9_-]{11}$/.test(raw)) {
+      const embedUrl = new URL(`https://www.youtube.com/embed/${raw}`);
+      embedUrl.searchParams.set('origin', 'https://yomite.vercel.app');
+      embedUrl.searchParams.set('enablejsapi', '1');
+      return embedUrl.toString();
+    }
+
+    const url = new URL(raw, 'https://animecorner.me');
     let videoId;
-    if (url.hostname === 'youtu.be') {
+    if (url.searchParams.get('yt_embed')) {
+      videoId = url.searchParams.get('yt_embed');
+    } else if (url.hostname === 'youtu.be') {
       videoId = url.pathname.replace(/^\/+/, '').split('/')[0];
-    } else if (url.hostname === 'youtube.com' || url.hostname.endsWith('.youtube.com')) {
+    } else if (url.hostname.includes('youtube.com')) {
       videoId = url.searchParams.get('v')
         || url.pathname.match(/\/embed\/([^/?]+)/)?.[1]
         || url.pathname.match(/\/shorts\/([^/?]+)/)?.[1];
@@ -74,6 +85,18 @@ function getYoutubeEmbedUrl(value) {
   } catch {
     return undefined;
   }
+}
+
+function parseHighestResFromSrcset(srcset) {
+  if (!srcset) return null;
+  const parts = srcset.split(',').map((part) => {
+    const [u, w] = part.trim().split(/\s+/);
+    const width = parseInt(w?.replace(/\D/g, '') || '0', 10);
+    return { url: u, width };
+  }).filter((p) => p.url && !p.url.startsWith('data:'));
+  if (parts.length === 0) return null;
+  parts.sort((a, b) => b.width - a.width);
+  return parts[0].url;
 }
 
 function toAbsoluteUrl(value, baseUrl) {
@@ -181,32 +204,85 @@ async function fetchArticle(url) {
 
   const html = await response.text();
   const $ = cheerio.load(html);
-  const trailerUrls = $('iframe, a')
+
+  // 1. Promotional Videos (PV) / Trailers
+  const trailerUrls = $('iframe, a, div[data-video-id], div[data-youtube-id]')
     .map((_, element) => getYoutubeEmbedUrl(
-      $(element).attr('src') || $(element).attr('data-src') || $(element).attr('href')
+      $(element).attr('src')
+        || $(element).attr('data-src')
+        || $(element).attr('data-lazy-src')
+        || $(element).attr('href')
+        || $(element).attr('data-video-id')
+        || $(element).attr('data-youtube-id')
     ))
     .get()
     .filter(Boolean)
-    .filter((url, index, values) => values.indexOf(url) === index);
-  const imageUrls = [
+    .filter((v, index, values) => values.indexOf(v) === index);
+
+  // 2. High-res Images
+  const rawImageUrls = [
     $('meta[property="og:image"]').attr('content'),
     $('meta[name="twitter:image"]').attr('content'),
     $('link[rel="image_src"]').attr('href'),
-    ...$('article img, main img, figure img')
-      .map((_, element) => $(element).attr('src') || $(element).attr('data-src') || $(element).attr('data-lazy-src'))
-      .get(),
-  ]
+    parseHighestResFromSrcset($('link[rel="preload"][as="image"]').attr('imagesrcset')),
+    $('link[rel="preload"][as="image"]').attr('href'),
+  ];
+
+  // Also extract any JSON-LD primary image if available
+  $('script[type="application/ld+json"]').each((_, element) => {
+    try {
+      const data = JSON.parse($(element).html() || '{}');
+      const graph = data['@graph'] || (Array.isArray(data) ? data : [data]);
+      for (const node of graph) {
+        if (node.thumbnailUrl) rawImageUrls.push(node.thumbnailUrl);
+        if (node.image?.url) rawImageUrls.push(node.image.url);
+        if (node.contentUrl && node['@type'] === 'ImageObject') rawImageUrls.push(node.contentUrl);
+      }
+    } catch {}
+  });
+
+  const entryRoot = $('.entry-content, .ac-single-entry, article.ac-single-article, article, main').first();
+  const targetScope = entryRoot.length ? entryRoot : $('body');
+
+  targetScope.find('img').each((_, element) => {
+    const cls = $(element).attr('class') || '';
+    if (cls.includes('avatar') || cls.includes('author')) return;
+
+    const srcsetBest = parseHighestResFromSrcset($(element).attr('srcset') || $(element).attr('data-srcset'));
+    const candidate = srcsetBest
+      || $(element).attr('data-src')
+      || $(element).attr('data-lazy-src')
+      || $(element).attr('src');
+
+    if (candidate && !candidate.startsWith('data:') && !candidate.includes('150x150') && !candidate.includes('gravatar')) {
+      rawImageUrls.push(candidate);
+    }
+  });
+
+  const imageUrls = rawImageUrls
     .map((value) => toAbsoluteUrl(value, url))
     .filter(Boolean)
     .filter((value, index, values) => values.indexOf(value) === index)
     .slice(0, 30);
-  $('script, style, noscript, nav, aside, footer, form, iframe').remove();
 
-  const articleRoot = $('article').first().length ? $('article').first() : $('main').first();
-  const paragraphs = articleRoot.find('p').map((_, element) => cleanText($(element).text())).get()
-    .filter((paragraph) => paragraph.length > 25);
-  const content = paragraphs.length > 0 ? paragraphs : $('p').map((_, element) => cleanText($(element).text())).get()
-    .filter((paragraph) => paragraph.length > 25);
+  // 3. Clean Article Text / Paragraphs
+  const content = [];
+  targetScope.find('p').each((_, element) => {
+    const parentClass = $(element).parent().attr('class') || '';
+    if (
+      parentClass.includes('author') ||
+      parentClass.includes('comment') ||
+      parentClass.includes('panel') ||
+      parentClass.includes('ezoic') ||
+      parentClass.includes('ezmob')
+    ) {
+      return;
+    }
+    const txt = cleanText($(element).text());
+    if (txt.length > 20) {
+      content.push(txt);
+    }
+  });
 
   const value = {
     title: cleanText($('meta[property="og:title"]').attr('content') || $('title').text()),
