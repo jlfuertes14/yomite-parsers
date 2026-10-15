@@ -281,11 +281,7 @@ async function fetchArticle(url) {
 
   // 3. Clean Article Text, Sub-headlines, Lists & Quotes
   const content = [];
-
   const introText = cleanText($('.intro').first().text());
-  if (introText && introText.length > 10) {
-    content.push(introText);
-  }
 
   targetScope.find('p, ul, blockquote').each((_, element) => {
     const el = $(element);
