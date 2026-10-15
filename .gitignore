@@ -2,3 +2,5 @@ node_modules/
 .env
 .env.*
 npm-debug.log*
+app.json
+eas.json
