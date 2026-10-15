@@ -297,7 +297,14 @@ async function fetchArticle(url) {
   });
 
   const primaryCover = cleanOgImage || rawBodyImages[0];
-  const visuals = rawBodyImages.length > 0 ? rawBodyImages : (cleanOgImage ? [cleanOgImage] : []);
+  const coverKey = normalizeImageKey(primaryCover);
+
+  // If anime news content has only one image and it's already used as the cover image (or is the cover image),
+  // do not include it in visuals so that the Official Visuals gallery is not redundantly rendered.
+  const nonCoverBodyImages = rawBodyImages.filter((img) => normalizeImageKey(img) !== coverKey);
+  const visuals = nonCoverBodyImages.length > 0
+    ? nonCoverBodyImages
+    : (rawBodyImages.length > 1 ? rawBodyImages : []);
 
   // 3. Clean Article Text, Sub-headlines, Lists & Quotes
   const content = [];
