@@ -164,7 +164,7 @@ async function fetchFeed() {
   results.sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime());
 
   if (results.length > 0) {
-    const enrichedItems = await Promise.all(results.slice(0, 10).map(async (item) => {
+    const enrichedItems = await Promise.all(results.slice(0, 20).map(async (item) => {
       try {
         const article = await fetchArticle(item.url);
         return {
@@ -178,7 +178,7 @@ async function fetchFeed() {
         return item;
       }
     }));
-    const mergedItems = [...enrichedItems, ...results.slice(10)];
+    const mergedItems = [...enrichedItems, ...results.slice(20)];
     feedCache.value = mergedItems;
     feedCache.expiresAt = Date.now() + feedTtlMs;
     return mergedItems;
@@ -225,7 +225,7 @@ async function fetchArticle(url) {
     .filter(Boolean)
     .filter((v, index, values) => values.indexOf(v) === index);
 
-  // 2. High-res Images
+  // 2. High-res Images & Galleries
   const rawImageUrls = [
     $('meta[property="og:image"]').attr('content'),
     $('meta[name="twitter:image"]').attr('content'),
@@ -247,13 +247,20 @@ async function fetchArticle(url) {
     } catch {}
   });
 
-  const entryRoot = $('.meat, .entry-content, .ac-single-entry, article.ac-single-article, #content-zone .news, article, main').first();
-  const targetScope = entryRoot.length ? entryRoot : $('body');
-
-  targetScope.find('img').each((_, element) => {
+  // Comprehensive image selectors covering ANN (.meat, figure, #content-zone) and Anime Corner (.entry-content, .ac-single-entry)
+  $('article img, main img, #content-zone img, .meat img, .entry-content img, .ac-single-entry img, figure img, .wp-block-image img').each((_, element) => {
     const cls = $(element).attr('class') || '';
     const src = $(element).attr('src') || '';
-    if (cls.includes('avatar') || cls.includes('author') || src.includes('bookmark-shorturl') || src.includes('/system/')) return;
+    if (
+      cls.includes('avatar') ||
+      cls.includes('author') ||
+      src.includes('bookmark-shorturl') ||
+      src.includes('/system/') ||
+      src.includes('icon-') ||
+      src.includes('favicon')
+    ) {
+      return;
+    }
 
     const srcsetBest = parseHighestResFromSrcset($(element).attr('srcset') || $(element).attr('data-srcset'));
     const candidate = srcsetBest
