@@ -1,16 +1,18 @@
-import express from 'express';
-import cors from 'cors';
-import Parser from 'rss-parser';
 import * as cheerio from 'cheerio';
+import cors from 'cors';
+import express from 'express';
+import Parser from 'rss-parser';
 
 const app = express();
 const port = Number(process.env.PORT || 10000);
 const feedParser = new Parser({ timeout: 15000 });
-const feedUrls = [
+const annFeedUrls = [
   'https://www.animenewsnetwork.com/news/rss.xml?ann-edition=us',
   'https://www.animenewsnetwork.com/all/rss.xml?ann-edition=us',
   'https://www.animenewsnetwork.com/all/rss.xml',
 ];
+const animeCornerFeedUrl = 'https://animecorner.me/feed/';
+
 const feedCache = { value: null, expiresAt: 0 };
 const articleCache = new Map();
 const feedTtlMs = 15 * 60 * 1000;
@@ -36,7 +38,8 @@ function isAllowedArticleUrl(value) {
   try {
     const url = new URL(value);
     return url.protocol === 'https:' && (
-      url.hostname === 'animenewsnetwork.com' || url.hostname.endsWith('.animenewsnetwork.com')
+      url.hostname === 'animenewsnetwork.com' || url.hostname.endsWith('.animenewsnetwork.com') ||
+      url.hostname === 'animecorner.me' || url.hostname.endsWith('.animecorner.me')
     );
   } catch {
     return false;
@@ -85,8 +88,10 @@ function toAbsoluteUrl(value, baseUrl) {
 async function fetchFeed() {
   if (feedCache.value && feedCache.expiresAt > Date.now()) return feedCache.value;
 
-  let lastError;
-  for (const feedUrl of feedUrls) {
+  const results = [];
+
+  // 1. Fetch Anime News Network
+  for (const feedUrl of annFeedUrls) {
     try {
       const feed = await feedParser.parseURL(feedUrl);
       const items = feed.items.map((item, index) => ({
@@ -100,42 +105,71 @@ async function fetchFeed() {
       })).filter((item) => item.url);
 
       if (items.length > 0) {
-        const enrichedItems = await Promise.all(items.slice(0, 8).map(async (item) => {
-          try {
-            const article = await fetchArticle(item.url);
-            return {
-              ...item,
-              imageUrl: article.imageUrl || item.imageUrl,
-              images: article.images,
-              trailerUrl: article.trailerUrl,
-              trailerUrls: article.trailerUrls,
-            };
-          } catch {
-            return item;
-          }
-        }));
-        const mergedItems = [...enrichedItems, ...items.slice(8)];
-        feedCache.value = mergedItems;
-        feedCache.expiresAt = Date.now() + feedTtlMs;
-        return mergedItems;
+        results.push(...items);
+        break;
       }
-    } catch (error) {
-      lastError = error;
-    }
+    } catch { }
   }
 
-  throw lastError || new Error('Anime News Network feed unavailable');
+  // 2. Fetch Anime Corner
+  try {
+    const acFeed = await feedParser.parseURL(animeCornerFeedUrl);
+    const acItems = acFeed.items.map((item, index) => ({
+      id: String(item.guid || item.link || `ac-${index}`),
+      title: cleanText(item.title || 'Anime Corner update'),
+      summary: cleanText(item.contentSnippet || item.content || 'Read the latest update from Anime Corner.'),
+      publishedAt: item.isoDate || item.pubDate || new Date().toISOString(),
+      url: item.link || '',
+      imageUrl: getImageUrl(item),
+      source: 'Anime Corner',
+    })).filter((item) => item.url);
+
+    if (acItems.length > 0) {
+      results.push(...acItems);
+    }
+  } catch (acErr) {
+    console.warn('Anime Corner feed fetch failed:', acErr.message);
+  }
+
+  // 3. Sort chronologically by posting timestamp descending (newest first)
+  results.sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime());
+
+  if (results.length > 0) {
+    const enrichedItems = await Promise.all(results.slice(0, 10).map(async (item) => {
+      try {
+        const article = await fetchArticle(item.url);
+        return {
+          ...item,
+          imageUrl: article.imageUrl || item.imageUrl,
+          images: article.images,
+          trailerUrl: article.trailerUrl,
+          trailerUrls: article.trailerUrls,
+        };
+      } catch {
+        return item;
+      }
+    }));
+    const mergedItems = [...enrichedItems, ...results.slice(10)];
+    feedCache.value = mergedItems;
+    feedCache.expiresAt = Date.now() + feedTtlMs;
+    return mergedItems;
+  }
+
+  throw new Error('Anime news feeds unavailable');
 }
 
 async function fetchArticle(url) {
   if (!isAllowedArticleUrl(url)) {
-    const error = new Error('Only Anime News Network article URLs are supported');
+    const error = new Error('Only Anime News Network and Anime Corner article URLs are supported');
     error.statusCode = 400;
     throw error;
   }
 
   const cached = articleCache.get(url);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+  const isAc = url.includes('animecorner.me');
+  const sourceName = isAc ? 'Anime Corner' : 'Anime News Network';
 
   const response = await fetch(url, {
     headers: {
@@ -183,7 +217,7 @@ async function fetchArticle(url) {
     trailerUrls,
     publishedAt: $('meta[property="article:published_time"]').attr('content') || undefined,
     url,
-    source: 'Anime News Network',
+    source: sourceName,
     content: content.slice(0, 100),
   };
 
@@ -197,9 +231,9 @@ app.get('/health', (_req, res) => {
 
 app.get('/api/news', async (_req, res) => {
   try {
-    res.json({ source: 'Anime News Network', items: await fetchFeed() });
-  } catch (error) {
-    res.status(502).json({ error: 'Anime News Network feed unavailable' });
+    res.json({ source: 'Aggregated Anime News', items: await fetchFeed() });
+  } catch {
+    res.status(502).json({ error: 'Anime news feeds unavailable' });
   }
 });
 
