@@ -102,7 +102,13 @@ function parseHighestResFromSrcset(srcset) {
 function toAbsoluteUrl(value, baseUrl) {
   if (!value) return undefined;
   try {
-    return new URL(value, baseUrl).toString();
+    let clean = String(value).trim();
+    if (clean.startsWith('//')) clean = 'https:' + clean;
+    // Upgrade ANN max300x600 to max600x600 for high-res clarity
+    if (clean.includes('animenewsnetwork.com/thumbnails/max300x600/')) {
+      clean = clean.replace('thumbnails/max300x600/', 'thumbnails/max600x600/');
+    }
+    return new URL(clean, baseUrl).toString();
   } catch {
     return undefined;
   }
@@ -241,18 +247,19 @@ async function fetchArticle(url) {
     } catch {}
   });
 
-  const entryRoot = $('.entry-content, .ac-single-entry, article.ac-single-article, article, main').first();
+  const entryRoot = $('.meat, .entry-content, .ac-single-entry, article.ac-single-article, #content-zone .news, article, main').first();
   const targetScope = entryRoot.length ? entryRoot : $('body');
 
   targetScope.find('img').each((_, element) => {
     const cls = $(element).attr('class') || '';
-    if (cls.includes('avatar') || cls.includes('author')) return;
+    const src = $(element).attr('src') || '';
+    if (cls.includes('avatar') || cls.includes('author') || src.includes('bookmark-shorturl') || src.includes('/system/')) return;
 
     const srcsetBest = parseHighestResFromSrcset($(element).attr('srcset') || $(element).attr('data-srcset'));
     const candidate = srcsetBest
       || $(element).attr('data-src')
       || $(element).attr('data-lazy-src')
-      || $(element).attr('src');
+      || src;
 
     if (candidate && !candidate.startsWith('data:') && !candidate.includes('150x150') && !candidate.includes('gravatar')) {
       rawImageUrls.push(candidate);
@@ -265,33 +272,73 @@ async function fetchArticle(url) {
     .filter((value, index, values) => values.indexOf(value) === index)
     .slice(0, 30);
 
-  // 3. Clean Article Text / Paragraphs
+  // 3. Clean Article Text, Sub-headlines, Lists & Quotes
   const content = [];
-  targetScope.find('p').each((_, element) => {
-    const parentClass = $(element).parent().attr('class') || '';
+
+  const introText = cleanText($('.intro').first().text());
+  if (introText && introText.length > 10) {
+    content.push(introText);
+  }
+
+  targetScope.find('p, ul, blockquote').each((_, element) => {
+    const el = $(element);
+    const parentClass = el.parent().attr('class') || '';
     if (
       parentClass.includes('author') ||
       parentClass.includes('comment') ||
       parentClass.includes('panel') ||
       parentClass.includes('ezoic') ||
-      parentClass.includes('ezmob')
+      parentClass.includes('ezmob') ||
+      parentClass.includes('social')
     ) {
       return;
     }
-    const txt = cleanText($(element).text());
-    if (txt.length > 20) {
-      content.push(txt);
+
+    const tagName = element.tagName ? element.tagName.toLowerCase() : '';
+    if (tagName === 'ul') {
+      el.find('li').each((__, li) => {
+        const item = cleanText($(li).text());
+        if (item.length > 3) content.push(`• ${item}`);
+      });
+    } else if (tagName === 'blockquote') {
+      const quote = cleanText(el.text());
+      if (quote.length > 15) content.push(`“${quote}”`);
+    } else {
+      const txt = cleanText(el.text());
+      if (
+        txt.length > 20 &&
+        !txt.startsWith('Disclosure:') &&
+        !txt.includes('discuss this in the forum') &&
+        !txt.includes('bookmark/share with')
+      ) {
+        content.push(txt);
+      }
     }
   });
 
+  // Clean title: remove any leftover "News" subtitle prefix from ANN page_header
+  let title = cleanText($('meta[property="og:title"]').attr('content') || '');
+  if (!title) {
+    const headerEl = $('#page_header').clone();
+    headerEl.find('.sub-title').remove();
+    title = cleanText(headerEl.text() || $('title').text());
+  }
+
+  let summary = cleanText($('meta[property="og:description"]').attr('content') || '');
+  if (!summary && introText) {
+    summary = introText;
+  }
+
   const value = {
-    title: cleanText($('meta[property="og:title"]').attr('content') || $('title').text()),
-    summary: cleanText($('meta[property="og:description"]').attr('content') || ''),
+    title,
+    summary,
     imageUrl: imageUrls[0],
     images: imageUrls,
     trailerUrl: trailerUrls[0],
     trailerUrls,
-    publishedAt: $('meta[property="article:published_time"]').attr('content') || undefined,
+    publishedAt: $('meta[property="article:published_time"]').attr('content')
+      || $('time').first().attr('datetime')
+      || undefined,
     url,
     source: sourceName,
     content: content.slice(0, 100),
