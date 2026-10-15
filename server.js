@@ -87,6 +87,19 @@ function getYoutubeEmbedUrl(value) {
   }
 }
 
+function getOriginalWordPressUrl(url) {
+  if (!url) return '';
+  // Remove WordPress resize dimension suffix e.g. -1024x576.jpg -> .jpg
+  return url.replace(/-\d+x\d+(\.[a-zA-Z0-9]+)(\?.*)?$/, '$1');
+}
+
+function normalizeImageKey(url) {
+  if (!url) return '';
+  const clean = getOriginalWordPressUrl(url).split('?')[0];
+  const filename = clean.split('/').pop() || clean;
+  return filename.toLowerCase();
+}
+
 function parseHighestResFromSrcset(srcset) {
   if (!srcset) return null;
   const parts = srcset.split(',').map((part) => {
@@ -225,36 +238,38 @@ async function fetchArticle(url) {
     .filter(Boolean)
     .filter((v, index, values) => values.indexOf(v) === index);
 
-  // 2. High-res Images & Galleries
-  const rawImageUrls = [
-    $('meta[property="og:image"]').attr('content'),
-    $('meta[name="twitter:image"]').attr('content'),
-    $('link[rel="image_src"]').attr('href'),
-    parseHighestResFromSrcset($('link[rel="preload"][as="image"]').attr('imagesrcset')),
-    $('link[rel="preload"][as="image"]').attr('href'),
-  ];
+  // 2. Resolve Article Content Container Scope
+  const targetScope = isAc
+    ? ($('.entry-content').first().length ? $('.entry-content').first() : $('.ac-single-entry').first().length ? $('.ac-single-entry').first() : $('article').first())
+    : ($('#content-zone .meat').first().length ? $('#content-zone .meat').first() : $('.meat').first().length ? $('.meat').first() : $('article').first());
 
-  // Also extract any JSON-LD primary image if available
-  $('script[type="application/ld+json"]').each((_, element) => {
-    try {
-      const data = JSON.parse($(element).html() || '{}');
-      const graph = data['@graph'] || (Array.isArray(data) ? data : [data]);
-      for (const node of graph) {
-        if (node.thumbnailUrl) rawImageUrls.push(node.thumbnailUrl);
-        if (node.image?.url) rawImageUrls.push(node.image.url);
-        if (node.contentUrl && node['@type'] === 'ImageObject') rawImageUrls.push(node.contentUrl);
-      }
-    } catch {}
-  });
+  // Primary cover image (clean original version)
+  const ogImageRaw = $('meta[property="og:image"]').attr('content')
+    || $('meta[name="twitter:image"]').attr('content')
+    || $('link[rel="image_src"]').attr('href');
+  const cleanOgImage = ogImageRaw ? getOriginalWordPressUrl(toAbsoluteUrl(ogImageRaw, url)) : undefined;
 
-  // Comprehensive image selectors covering ANN (.meat, figure, #content-zone) and Anime Corner (.entry-content, .ac-single-entry)
-  $('article img, main img, #content-zone img, .meat img, .entry-content img, .ac-single-entry img, figure img, .wp-block-image img').each((_, element) => {
-    const cls = $(element).attr('class') || '';
-    const src = $(element).attr('src') || '';
+  // Extract the REAL visual arts & key visuals strictly from within article body
+  const rawBodyImages = [];
+  const seenKeys = new Set();
+
+  targetScope.find('img').each((_, element) => {
+    const el = $(element);
+    const cls = el.attr('class') || '';
+    const src = el.attr('src') || '';
+    const parentCls = el.parent().attr('class') || '';
+    const grandParentCls = el.parent().parent().attr('class') || '';
+
     if (
       cls.includes('avatar') ||
       cls.includes('author') ||
-      src.includes('bookmark-shorturl') ||
+      cls.includes('wp-smiley') ||
+      parentCls.includes('author') ||
+      parentCls.includes('avatar') ||
+      parentCls.includes('penci-post-related') ||
+      grandParentCls.includes('penci-post-related') ||
+      src.includes('150x150') ||
+      src.includes('gravatar') ||
       src.includes('/system/') ||
       src.includes('icon-') ||
       src.includes('favicon')
@@ -262,22 +277,27 @@ async function fetchArticle(url) {
       return;
     }
 
-    const srcsetBest = parseHighestResFromSrcset($(element).attr('srcset') || $(element).attr('data-srcset'));
+    const srcsetBest = parseHighestResFromSrcset(el.attr('srcset') || el.attr('data-srcset'));
     const candidate = srcsetBest
-      || $(element).attr('data-src')
-      || $(element).attr('data-lazy-src')
+      || el.attr('data-src')
+      || el.attr('data-lazy-src')
       || src;
 
     if (candidate && !candidate.startsWith('data:') && !candidate.includes('150x150') && !candidate.includes('gravatar')) {
-      rawImageUrls.push(candidate);
+      const absUrl = toAbsoluteUrl(candidate, url);
+      if (absUrl) {
+        const originalUrl = getOriginalWordPressUrl(absUrl);
+        const key = normalizeImageKey(originalUrl);
+        if (!seenKeys.has(key)) {
+          seenKeys.add(key);
+          rawBodyImages.push(originalUrl);
+        }
+      }
     }
   });
 
-  const imageUrls = rawImageUrls
-    .map((value) => toAbsoluteUrl(value, url))
-    .filter(Boolean)
-    .filter((value, index, values) => values.indexOf(value) === index)
-    .slice(0, 30);
+  const primaryCover = cleanOgImage || rawBodyImages[0];
+  const visuals = rawBodyImages.length > 0 ? rawBodyImages : (cleanOgImage ? [cleanOgImage] : []);
 
   // 3. Clean Article Text, Sub-headlines, Lists & Quotes
   const content = [];
@@ -335,8 +355,8 @@ async function fetchArticle(url) {
   const value = {
     title,
     summary,
-    imageUrl: imageUrls[0],
-    images: imageUrls,
+    imageUrl: primaryCover,
+    images: visuals,
     trailerUrl: trailerUrls[0],
     trailerUrls,
     publishedAt: $('meta[property="article:published_time"]').attr('content')
