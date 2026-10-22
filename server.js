@@ -25,6 +25,10 @@ const releaseCache = { value: null, expiresAt: 0 };
 const feedTtlMs = 15 * 60 * 1000;
 const articleTtlMs = 60 * 60 * 1000;
 
+function logReleaseEvent(message, details = {}) {
+  console.info(`[yomite-releases] ${message}`, details);
+}
+
 const allowedOrigins = (process.env.CORS_ORIGINS || '*')
   .split(',')
   .map((origin) => origin.trim())
@@ -46,6 +50,7 @@ async function supabaseRequest(path, options = {}) {
     throw new Error('Supabase service configuration is missing');
   }
 
+  const method = options.method || 'GET';
   const response = await fetch(`${supabaseUrl}/rest/v1/${path}`, {
     ...options,
     headers: {
@@ -57,6 +62,13 @@ async function supabaseRequest(path, options = {}) {
   });
 
   if (!response.ok) {
+    const errorBody = await response.text().catch(() => '');
+    logReleaseEvent('Supabase request failed', {
+      method,
+      path: path.split('?')[0],
+      status: response.status,
+      body: errorBody.slice(0, 300),
+    });
     throw new Error(`Supabase request failed with ${response.status}`);
   }
 
@@ -65,6 +77,12 @@ async function supabaseRequest(path, options = {}) {
   // PostgREST returns an empty body for requests using Prefer: return=minimal.
   // Do not attempt response.json() on that successful empty response.
   const responseText = await response.text();
+  logReleaseEvent('Supabase request succeeded', {
+    method,
+    path: path.split('?')[0],
+    status: response.status,
+    hasBody: Boolean(responseText.trim()),
+  });
   if (!responseText.trim()) return null;
 
   try {
@@ -313,9 +331,16 @@ function toAbsoluteUrl(value, baseUrl) {
 }
 
 async function fetchFeed() {
-  if (feedCache.value && feedCache.expiresAt > Date.now()) return feedCache.value;
+  if (feedCache.value && feedCache.expiresAt > Date.now()) {
+    logReleaseEvent('News feed cache hit', { itemCount: feedCache.value.length });
+    return feedCache.value;
+  }
 
   const results = [];
+  logReleaseEvent('News feed refresh started', {
+    annSources: annFeedUrls.length,
+    animeCornerSource: true,
+  });
 
   // 1. Fetch Anime News Network
   for (const feedUrl of annFeedUrls) {
@@ -333,9 +358,21 @@ async function fetchFeed() {
 
       if (items.length > 0) {
         results.push(...items);
+        logReleaseEvent('Anime News Network feed loaded', {
+          source: new URL(feedUrl).hostname,
+          itemCount: items.length,
+        });
         break;
       }
-    } catch { }
+      logReleaseEvent('Anime News Network feed returned no usable items', {
+        source: new URL(feedUrl).hostname,
+      });
+    } catch (error) {
+      logReleaseEvent('Anime News Network feed failed', {
+        source: new URL(feedUrl).hostname,
+        error: error.message || 'unknown error',
+      });
+    }
   }
 
   // 2. Fetch Anime Corner
@@ -354,14 +391,16 @@ async function fetchFeed() {
     if (acItems.length > 0) {
       results.push(...acItems);
     }
+    logReleaseEvent('Anime Corner feed loaded', { itemCount: acItems.length });
   } catch (acErr) {
-    console.warn('Anime Corner feed fetch failed:', acErr.message);
+    logReleaseEvent('Anime Corner feed failed', { error: acErr.message || 'unknown error' });
   }
 
   // 3. Sort chronologically by posting timestamp descending (newest first)
   results.sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime());
 
   if (results.length > 0) {
+    logReleaseEvent('News feed enrichment started', { itemCount: Math.min(results.length, 20) });
     const enrichedItems = await Promise.all(results.slice(0, 20).map(async (item) => {
       try {
         const article = await fetchArticle(item.url);
@@ -372,16 +411,22 @@ async function fetchFeed() {
           trailerUrl: article.trailerUrl,
           trailerUrls: article.trailerUrls,
         };
-      } catch {
+      } catch (error) {
+        logReleaseEvent('News article enrichment failed', {
+          source: item.source,
+          error: error.message || 'unknown error',
+        });
         return item;
       }
     }));
     const mergedItems = [...enrichedItems, ...results.slice(20)];
     feedCache.value = mergedItems;
     feedCache.expiresAt = Date.now() + feedTtlMs;
+    logReleaseEvent('News feed refresh completed', { itemCount: mergedItems.length });
     return mergedItems;
   }
 
+  logReleaseEvent('News feed refresh failed: no usable items');
   throw new Error('Anime news feeds unavailable');
 }
 
@@ -397,6 +442,8 @@ async function fetchArticle(url) {
 
   const isAc = url.includes('animecorner.me');
   const sourceName = isAc ? 'Anime Corner' : 'Anime News Network';
+
+  logReleaseEvent('News article request started', { source: sourceName });
 
   const response = await fetch(url, {
     headers: {
@@ -601,6 +648,14 @@ app.post('/api/releases/subscribe', async (req, res) => {
   const channel = String(req.body?.channel || 'stable').trim().toLowerCase();
   const appVersion = String(req.body?.appVersion || '').trim();
 
+  logReleaseEvent('Subscription request received', {
+    platform,
+    channel,
+    appVersion,
+    hasPushToken: Boolean(pushToken),
+    tokenFormatValid: /^ExponentPushToken\[.+\]$/.test(pushToken),
+  });
+
   if (!pushToken || !/^ExponentPushToken\[.+\]$/.test(pushToken)) {
     return res.status(400).json({ error: 'A valid Expo push token is required' });
   }
@@ -618,14 +673,22 @@ app.post('/api/releases/subscribe', async (req, res) => {
         last_seen_at: new Date().toISOString(),
       }),
     });
+    logReleaseEvent('Subscription saved', { platform, channel, appVersion });
     return res.json({ ok: true });
   } catch (error) {
+    logReleaseEvent('Subscription failed', {
+      platform,
+      channel,
+      appVersion,
+      error: error.message || 'unknown error',
+    });
     return res.status(502).json({ error: error.message || 'Subscription failed' });
   }
 });
 
 app.post('/api/releases/unsubscribe', async (req, res) => {
   const pushToken = String(req.body?.pushToken || '').trim();
+  logReleaseEvent('Unsubscribe request received', { hasPushToken: Boolean(pushToken) });
   if (!pushToken) return res.status(400).json({ error: 'Push token is required' });
 
   try {
@@ -634,25 +697,40 @@ app.post('/api/releases/unsubscribe', async (req, res) => {
       headers: { Prefer: 'return=minimal' },
       body: JSON.stringify({ enabled: false, last_seen_at: new Date().toISOString() }),
     });
+    logReleaseEvent('Subscription disabled');
     return res.json({ ok: true });
   } catch (error) {
+    logReleaseEvent('Unsubscribe failed', { error: error.message || 'unknown error' });
     return res.status(502).json({ error: error.message || 'Unsubscribe failed' });
   }
 });
 
 app.get('/api/news', async (_req, res) => {
+  logReleaseEvent('News API request received');
   try {
-    res.json({ source: 'Aggregated Anime News', items: await fetchFeed() });
-  } catch {
+    const items = await fetchFeed();
+    logReleaseEvent('News API request succeeded', { itemCount: items.length });
+    res.json({ source: 'Aggregated Anime News', items });
+  } catch (error) {
+    logReleaseEvent('News API request failed', { error: error.message || 'unknown error' });
     res.status(502).json({ error: 'Anime news feeds unavailable' });
   }
 });
 
 app.get('/api/news/article', async (req, res) => {
+  logReleaseEvent('News article API request received', {
+    hasUrl: Boolean(req.query.url),
+  });
   try {
     const url = String(req.query.url || '');
-    res.json(await fetchArticle(url));
+    const article = await fetchArticle(url);
+    logReleaseEvent('News article API request succeeded');
+    res.json(article);
   } catch (error) {
+    logReleaseEvent('News article API request failed', {
+      status: error.statusCode || 502,
+      error: error.message || 'unknown error',
+    });
     res.status(error.statusCode || 502).json({ error: error.message || 'Article unavailable' });
   }
 });
