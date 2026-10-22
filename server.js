@@ -42,7 +42,9 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 
 async function supabaseRequest(path, options = {}) {
-  if (!supabaseUrl || !supabaseServiceRoleKey) return null;
+  if (!supabaseUrl || !supabaseServiceRoleKey) {
+    throw new Error('Supabase service configuration is missing');
+  }
 
   const response = await fetch(`${supabaseUrl}/rest/v1/${path}`, {
     ...options,
@@ -59,7 +61,17 @@ async function supabaseRequest(path, options = {}) {
   }
 
   if (response.status === 204) return null;
-  return response.json();
+
+  // PostgREST returns an empty body for requests using Prefer: return=minimal.
+  // Do not attempt response.json() on that successful empty response.
+  const responseText = await response.text();
+  if (!responseText.trim()) return null;
+
+  try {
+    return JSON.parse(responseText);
+  } catch {
+    throw new Error('Supabase returned an invalid JSON response');
+  }
 }
 
 function normalizeRelease(data) {
@@ -401,11 +413,11 @@ async function fetchArticle(url) {
   const trailerUrls = $('iframe, a, div[data-video-id], div[data-youtube-id]')
     .map((_, element) => getYoutubeEmbedUrl(
       $(element).attr('src')
-        || $(element).attr('data-src')
-        || $(element).attr('data-lazy-src')
-        || $(element).attr('href')
-        || $(element).attr('data-video-id')
-        || $(element).attr('data-youtube-id')
+      || $(element).attr('data-src')
+      || $(element).attr('data-lazy-src')
+      || $(element).attr('href')
+      || $(element).attr('data-video-id')
+      || $(element).attr('data-youtube-id')
     ))
     .get()
     .filter(Boolean)
