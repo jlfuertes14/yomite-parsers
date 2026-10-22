@@ -5,6 +5,12 @@ import Parser from 'rss-parser';
 
 const app = express();
 const port = Number(process.env.PORT || 10000);
+const githubRepo = process.env.GITHUB_REPO || 'jlfuertes14/Yomite';
+const githubReleaseUrl = `https://api.github.com/repos/${githubRepo}/releases/latest`;
+const supabaseUrl = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const releaseSyncSecret = process.env.RELEASE_SYNC_SECRET || '';
+const releaseCacheTtlMs = 5 * 60 * 1000;
 const feedParser = new Parser({ timeout: 15000 });
 const annFeedUrls = [
   'https://www.animenewsnetwork.com/news/rss.xml?ann-edition=us',
@@ -15,6 +21,7 @@ const animeCornerFeedUrl = 'https://animecorner.me/feed/';
 
 const feedCache = { value: null, expiresAt: 0 };
 const articleCache = new Map();
+const releaseCache = { value: null, expiresAt: 0 };
 const feedTtlMs = 15 * 60 * 1000;
 const articleTtlMs = 60 * 60 * 1000;
 
@@ -33,6 +40,172 @@ app.use(cors({
   },
 }));
 app.use(express.json({ limit: '1mb' }));
+
+async function supabaseRequest(path, options = {}) {
+  if (!supabaseUrl || !supabaseServiceRoleKey) return null;
+
+  const response = await fetch(`${supabaseUrl}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      apikey: supabaseServiceRoleKey,
+      Authorization: `Bearer ${supabaseServiceRoleKey}`,
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Supabase request failed with ${response.status}`);
+  }
+
+  if (response.status === 204) return null;
+  return response.json();
+}
+
+function normalizeRelease(data) {
+  const tagName = String(data?.tag_name || '').trim();
+  const version = tagName.replace(/^v/i, '');
+  const assets = Array.isArray(data?.assets) ? data.assets : [];
+  const apk = assets.find((asset) => String(asset?.name || '').includes('universal.apk'))
+    || assets.find((asset) => String(asset?.name || '').endsWith('.apk'));
+
+  if (!version || !apk?.browser_download_url) return null;
+
+  return {
+    version,
+    tagName,
+    releaseTitle: data.name || `Yomite v${version}`,
+    releaseNotes: String(data.body || '').trim() || 'No release notes provided for this version.',
+    downloadUrl: apk.browser_download_url,
+    fileName: apk.name || `Yomite-${version}.apk`,
+    apkSize: Number(apk.size || 0),
+    publishedAt: data.published_at || new Date().toISOString(),
+    htmlUrl: data.html_url || `https://github.com/${githubRepo}/releases/tag/${tagName}`,
+    channel: 'stable',
+  };
+}
+
+async function fetchGitHubLatestRelease() {
+  const response = await fetch(githubReleaseUrl, {
+    headers: {
+      Accept: 'application/vnd.github.v3+json',
+      'User-Agent': 'Yomite-Release-Service',
+    },
+  });
+
+  if (!response.ok) throw new Error(`GitHub release request failed with ${response.status}`);
+  return normalizeRelease(await response.json());
+}
+
+async function getStoredLatestRelease() {
+  const rows = await supabaseRequest(
+    'yomite_releases?channel=eq.stable&select=*&order=published_at.desc&limit=1'
+  );
+  return Array.isArray(rows) && rows[0] ? {
+    version: rows[0].version,
+    tagName: rows[0].tag_name,
+    releaseTitle: rows[0].release_title,
+    releaseNotes: rows[0].release_notes,
+    downloadUrl: rows[0].download_url,
+    fileName: rows[0].file_name,
+    apkSize: rows[0].apk_size,
+    publishedAt: rows[0].published_at,
+    htmlUrl: rows[0].html_url,
+    channel: rows[0].channel,
+    releaseId: rows[0].id,
+  } : null;
+}
+
+async function getLatestRelease() {
+  if (releaseCache.value && releaseCache.expiresAt > Date.now()) return releaseCache.value;
+
+  let stored = null;
+  try {
+    stored = await getStoredLatestRelease();
+  } catch (error) {
+    console.warn('[release-service] Stored release lookup failed; using GitHub fallback:', error.message);
+  }
+  const release = stored || await fetchGitHubLatestRelease();
+  if (!release) return null;
+
+  releaseCache.value = release;
+  releaseCache.expiresAt = Date.now() + releaseCacheTtlMs;
+  return release;
+}
+
+async function saveRelease(release) {
+  const rows = await supabaseRequest('yomite_releases?on_conflict=version', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
+    body: JSON.stringify({
+      version: release.version,
+      tag_name: release.tagName,
+      release_title: release.releaseTitle,
+      release_notes: release.releaseNotes,
+      download_url: release.downloadUrl,
+      file_name: release.fileName,
+      apk_size: release.apkSize,
+      published_at: release.publishedAt,
+      html_url: release.htmlUrl,
+      channel: release.channel,
+    }),
+  });
+  return Array.isArray(rows) && rows[0] ? rows[0] : null;
+}
+
+async function sendReleasePush(release) {
+  const subscriptions = await supabaseRequest(
+    "yomite_release_subscriptions?enabled=eq.true&platform=eq.android&channel=eq.stable&select=push_token"
+  );
+  const tokens = [...new Set((subscriptions || []).map((row) => row.push_token).filter(Boolean))];
+  if (tokens.length === 0) return 0;
+
+  for (let offset = 0; offset < tokens.length; offset += 100) {
+    const messages = tokens.slice(offset, offset + 100).map((token) => ({
+      to: token,
+      title: `Yomite v${release.version} is available`,
+      body: release.releaseTitle || 'A new Yomite update is ready.',
+      sound: 'default',
+      priority: 'high',
+      channelId: 'yomite_chapter_updates',
+      data: { type: 'app-update', version: release.version, releaseId: release.releaseId },
+    }));
+
+    const response = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(messages),
+    });
+    if (!response.ok) throw new Error(`Expo push request failed with ${response.status}`);
+  }
+
+  return tokens.length;
+}
+
+async function syncLatestRelease() {
+  const release = await fetchGitHubLatestRelease();
+  if (!release) throw new Error('Latest GitHub release has no installable APK asset');
+
+  const existing = await supabaseRequest(
+    `yomite_releases?version=eq.${encodeURIComponent(release.version)}&select=id,notifications_sent_at&limit=1`
+  );
+  const stored = await saveRelease(release);
+  const alreadyNotified = existing?.[0]?.notifications_sent_at;
+  let notifiedCount = 0;
+
+  if (!alreadyNotified && stored) {
+    notifiedCount = await sendReleasePush({ ...release, releaseId: stored.id });
+    await supabaseRequest(`yomite_releases?id=eq.${stored.id}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ notifications_sent_at: new Date().toISOString() }),
+    });
+  }
+
+  releaseCache.value = { ...release, releaseId: stored?.id };
+  releaseCache.expiresAt = Date.now() + releaseCacheTtlMs;
+  return { release: releaseCache.value, notifiedCount };
+}
 
 function isAllowedArticleUrl(value) {
   try {
@@ -380,6 +553,79 @@ async function fetchArticle(url) {
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'yomite-parser' });
+});
+
+app.get('/api/releases/latest', async (req, res) => {
+  try {
+    const release = await getLatestRelease();
+    if (!release) return res.status(404).json({ error: 'No release available' });
+
+    const etag = `\"${release.version}\"`;
+    res.set('ETag', etag);
+    res.set('Cache-Control', 'public, max-age=300');
+    if (req.headers['if-none-match'] === etag) return res.status(304).end();
+    return res.json(release);
+  } catch (error) {
+    return res.status(502).json({ error: error.message || 'Release unavailable' });
+  }
+});
+
+app.post('/api/releases/sync', async (req, res) => {
+  if (!releaseSyncSecret || req.get('x-release-sync-secret') !== releaseSyncSecret) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const result = await syncLatestRelease();
+    return res.json({ ok: true, version: result.release.version, notified: result.notifiedCount });
+  } catch (error) {
+    return res.status(502).json({ error: error.message || 'Release sync failed' });
+  }
+});
+
+app.post('/api/releases/subscribe', async (req, res) => {
+  const pushToken = String(req.body?.pushToken || '').trim();
+  const platform = String(req.body?.platform || 'android').trim().toLowerCase();
+  const channel = String(req.body?.channel || 'stable').trim().toLowerCase();
+  const appVersion = String(req.body?.appVersion || '').trim();
+
+  if (!pushToken || !/^ExponentPushToken\[.+\]$/.test(pushToken)) {
+    return res.status(400).json({ error: 'A valid Expo push token is required' });
+  }
+
+  try {
+    await supabaseRequest('yomite_release_subscriptions?on_conflict=push_token', {
+      method: 'POST',
+      headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify({
+        push_token: pushToken,
+        platform,
+        channel,
+        app_version: appVersion || null,
+        enabled: true,
+        last_seen_at: new Date().toISOString(),
+      }),
+    });
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(502).json({ error: error.message || 'Subscription failed' });
+  }
+});
+
+app.post('/api/releases/unsubscribe', async (req, res) => {
+  const pushToken = String(req.body?.pushToken || '').trim();
+  if (!pushToken) return res.status(400).json({ error: 'Push token is required' });
+
+  try {
+    await supabaseRequest(`yomite_release_subscriptions?push_token=eq.${encodeURIComponent(pushToken)}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ enabled: false, last_seen_at: new Date().toISOString() }),
+    });
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(502).json({ error: error.message || 'Unsubscribe failed' });
+  }
 });
 
 app.get('/api/news', async (_req, res) => {

@@ -8,3 +8,11 @@ services:
     envVars:
       - key: CORS_ORIGINS
         value: https://yomite.vercel.app
+      - key: GITHUB_REPO
+        value: jlfuertes14/Yomite
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: RELEASE_SYNC_SECRET
+        sync: false
