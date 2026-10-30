@@ -16,3 +16,7 @@ services:
         sync: false
       - key: RELEASE_SYNC_SECRET
         sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: RELEASE_POLL_INTERVAL_MS
+        value: "900000"

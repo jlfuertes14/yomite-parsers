@@ -6,11 +6,16 @@ import Parser from 'rss-parser';
 const app = express();
 const port = Number(process.env.PORT || 10000);
 const githubRepo = process.env.GITHUB_REPO || 'jlfuertes14/Yomite';
+const githubToken = process.env.GITHUB_TOKEN || '';
 const githubReleaseUrl = `https://api.github.com/repos/${githubRepo}/releases/latest`;
 const supabaseUrl = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const releaseSyncSecret = process.env.RELEASE_SYNC_SECRET || '';
 const releaseCacheTtlMs = 5 * 60 * 1000;
+const releasePollIntervalMs = Math.max(
+  Number(process.env.RELEASE_POLL_INTERVAL_MS || 15 * 60 * 1000),
+  60 * 1000
+);
 const feedParser = new Parser({ timeout: 15000 });
 const annFeedUrls = [
   'https://www.animenewsnetwork.com/news/rss.xml?ann-edition=us',
@@ -115,13 +120,18 @@ function normalizeRelease(data) {
   };
 }
 
+let syncInProgressPromise = null;
+
 async function fetchGitHubLatestRelease() {
-  const response = await fetch(githubReleaseUrl, {
-    headers: {
-      Accept: 'application/vnd.github.v3+json',
-      'User-Agent': 'Yomite-Release-Service',
-    },
-  });
+  const headers = {
+    Accept: 'application/vnd.github.v3+json',
+    'User-Agent': 'Yomite-Release-Service',
+  };
+  if (githubToken) {
+    headers.Authorization = `token ${githubToken}`;
+  }
+
+  const response = await fetch(githubReleaseUrl, { headers });
 
   if (!response.ok) throw new Error(`GitHub release request failed with ${response.status}`);
   return normalizeRelease(await response.json());
@@ -149,18 +159,31 @@ async function getStoredLatestRelease() {
 async function getLatestRelease() {
   if (releaseCache.value && releaseCache.expiresAt > Date.now()) return releaseCache.value;
 
+  // Attempt live sync with GitHub to ensure we have the absolute newest release and notify subscribers if pending
+  try {
+    const result = await syncLatestRelease();
+    if (result?.release) return result.release;
+  } catch (error) {
+    logReleaseEvent('Live release sync during lookup failed; falling back to stored release', {
+      error: error.message || 'unknown error',
+    });
+  }
+
+  // Fallback to stored release in Supabase if live GitHub sync failed
   let stored = null;
   try {
     stored = await getStoredLatestRelease();
   } catch (error) {
-    console.warn('[release-service] Stored release lookup failed; using GitHub fallback:', error.message);
+    console.warn('[release-service] Stored release lookup failed:', error.message);
   }
-  const release = stored || await fetchGitHubLatestRelease();
-  if (!release) return null;
 
-  releaseCache.value = release;
-  releaseCache.expiresAt = Date.now() + releaseCacheTtlMs;
-  return release;
+  if (stored) {
+    releaseCache.value = stored;
+    releaseCache.expiresAt = Date.now() + releaseCacheTtlMs;
+    return stored;
+  }
+
+  return null;
 }
 
 async function saveRelease(release) {
@@ -213,28 +236,59 @@ async function sendReleasePush(release) {
 }
 
 async function syncLatestRelease() {
-  const release = await fetchGitHubLatestRelease();
-  if (!release) throw new Error('Latest GitHub release has no installable APK asset');
-
-  const existing = await supabaseRequest(
-    `yomite_releases?version=eq.${encodeURIComponent(release.version)}&select=id,notifications_sent_at&limit=1`
-  );
-  const stored = await saveRelease(release);
-  const alreadyNotified = existing?.[0]?.notifications_sent_at;
-  let notifiedCount = 0;
-
-  if (!alreadyNotified && stored) {
-    notifiedCount = await sendReleasePush({ ...release, releaseId: stored.id });
-    await supabaseRequest(`yomite_releases?id=eq.${stored.id}`, {
-      method: 'PATCH',
-      headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ notifications_sent_at: new Date().toISOString() }),
-    });
+  if (syncInProgressPromise) {
+    return syncInProgressPromise;
   }
 
-  releaseCache.value = { ...release, releaseId: stored?.id };
-  releaseCache.expiresAt = Date.now() + releaseCacheTtlMs;
-  return { release: releaseCache.value, notifiedCount };
+  syncInProgressPromise = (async () => {
+    try {
+      const release = await fetchGitHubLatestRelease();
+      if (!release) throw new Error('Latest GitHub release has no installable APK asset');
+
+      let existing = null;
+      let stored = null;
+      try {
+        existing = await supabaseRequest(
+          `yomite_releases?version=eq.${encodeURIComponent(release.version)}&select=id,notifications_sent_at&limit=1`
+        );
+        stored = await saveRelease(release);
+      } catch (err) {
+        logReleaseEvent('Supabase sync warning', { error: err.message || 'unknown error' });
+      }
+
+      const alreadyNotified = existing?.[0]?.notifications_sent_at;
+      let notifiedCount = 0;
+
+      if (!alreadyNotified && stored?.id) {
+        try {
+          notifiedCount = await sendReleasePush({ ...release, releaseId: stored.id });
+          await supabaseRequest(`yomite_releases?id=eq.${stored.id}`, {
+            method: 'PATCH',
+            headers: { Prefer: 'return=minimal' },
+            body: JSON.stringify({ notifications_sent_at: new Date().toISOString() }),
+          });
+          logReleaseEvent('Push notifications sent for new release', {
+            version: release.version,
+            notifiedCount,
+          });
+        } catch (pushError) {
+          logReleaseEvent('Failed to send push notifications', {
+            version: release.version,
+            error: pushError.message || 'unknown error',
+          });
+        }
+      }
+
+      const activeRelease = { ...release, releaseId: stored?.id || existing?.[0]?.id };
+      releaseCache.value = activeRelease;
+      releaseCache.expiresAt = Date.now() + releaseCacheTtlMs;
+      return { release: activeRelease, notifiedCount };
+    } finally {
+      syncInProgressPromise = null;
+    }
+  })();
+
+  return syncInProgressPromise;
 }
 
 function isAllowedArticleUrl(value) {
@@ -737,4 +791,34 @@ app.get('/api/news/article', async (req, res) => {
 
 app.listen(port, '0.0.0.0', () => {
   console.log(`yomite-parser listening on ${port}`);
+
+  // Auto-recovery: Check GitHub releases shortly after startup so any releases published while suspended are captured
+  setTimeout(async () => {
+    try {
+      logReleaseEvent('Startup release check triggered');
+      const result = await syncLatestRelease();
+      logReleaseEvent('Startup release check completed', {
+        version: result.release?.version,
+        notified: result.notifiedCount,
+      });
+    } catch (error) {
+      logReleaseEvent('Startup release check failed', { error: error.message || 'unknown error' });
+    }
+  }, 3000);
+
+  // Persistent checking: Poll GitHub releases periodically so newly published APKs are captured and notified
+  setInterval(async () => {
+    try {
+      logReleaseEvent('Periodic background release poll triggered');
+      const result = await syncLatestRelease();
+      if (result.notifiedCount > 0) {
+        logReleaseEvent('Periodic background release poll sent notifications', {
+          version: result.release?.version,
+          notified: result.notifiedCount,
+        });
+      }
+    } catch (error) {
+      logReleaseEvent('Periodic background release poll failed', { error: error.message || 'unknown error' });
+    }
+  }, releasePollIntervalMs);
 });

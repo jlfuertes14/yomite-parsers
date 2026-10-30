@@ -37,7 +37,15 @@ Set these Render environment variables:
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY` (never expose this to the app)
 - `RELEASE_SYNC_SECRET`
+- `GITHUB_TOKEN` (optional: increases GitHub API rate limit from 60 to 5,000 requests/hour)
+- `RELEASE_POLL_INTERVAL_MS` (optional: background poll cadence in ms, defaults to 900000 / 15 minutes)
 
 Run the release tables in the root `supabase_schema.sql` file before enabling
 the GitHub Actions release sync. The Android release workflow calls the sync
 endpoint after publishing the curated `release-notes/v{version}.md` body.
+
+The service also runs an auto-recovery check 3 seconds after boot and periodically
+polls GitHub releases in the background (default: every 15 minutes), ensuring that
+even if the server was asleep or suspended when a release occurred, it automatically
+recovers, syncs the newest release with Supabase, sends push notifications to pending devices,
+and serves the newest release on `GET /api/releases/latest`.
